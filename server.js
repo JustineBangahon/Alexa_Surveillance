@@ -7,11 +7,31 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Add proper error handling for uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('UNCAUGHT EXCEPTION:', error);
+});
+
 // Enable CORS for all routes
 app.use(cors());
 
 // Parse JSON request bodies
-app.use(bodyParser.json());
+app.use(bodyParser.json({
+  verify: (req, res, buf) => {
+    try {
+      JSON.parse(buf);
+    } catch(e) {
+      console.error('Invalid JSON:', e);
+      res.status(400).send('Invalid JSON');
+      throw new Error('Invalid JSON');
+    }
+  }
+}));
+
+// Simple root route to check if server is running
+app.get('/', (req, res) => {
+  res.status(200).send('Surveillance server is running');
+});
 
 // Store connected clients
 let connectedPis = {};
@@ -39,30 +59,37 @@ const authenticateApi = (req, res, next) => {
 app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'ok',
-    connectedClients: Object.keys(connectedPis).length
+    connectedClients: Object.keys(connectedPis).length,
+    apiKey: process.env.API_KEY ? 'configured' : 'missing',
+    raspberryPiUrl: process.env.DEFAULT_RASPBERRY_PI_URL || 'not set'
   });
 });
 
 // Register a Raspberry Pi with the server
 app.post('/api/register', authenticateApi, (req, res) => {
-  const { clientId, url, name } = req.body;
-  
-  if (!clientId || !url) {
-    return res.status(400).json({ error: 'Missing required parameters' });
+  try {
+    const { clientId, url, name } = req.body;
+    
+    if (!clientId || !url) {
+      return res.status(400).json({ error: 'Missing required parameters' });
+    }
+    
+    connectedPis[clientId] = {
+      url,
+      name: name || 'Unnamed Pi',
+      lastSeen: new Date()
+    };
+    
+    console.log(`Registered client: ${clientId}, ${url}`);
+    
+    return res.status(200).json({ 
+      success: true,
+      message: `Registered client: ${clientId}`
+    });
+  } catch (error) {
+    console.error('Error in /api/register:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
-  
-  connectedPis[clientId] = {
-    url,
-    name: name || 'Unnamed Pi',
-    lastSeen: new Date()
-  };
-  
-  console.log(`Registered client: ${clientId}, ${url}`);
-  
-  return res.status(200).json({ 
-    success: true,
-    message: `Registered client: ${clientId}`
-  });
 });
 
 // API endpoint that forwards requests to the Raspberry Pi
@@ -73,6 +100,8 @@ app.post('/api/alexa', authenticateApi, async (req, res) => {
     // Get the client ID from the request or use default
     const clientId = req.headers['x-client-id'] || 'default';
     const raspberryPiUrl = getRaspberryPiUrl(clientId);
+    
+    console.log(`Forwarding to Raspberry Pi at: ${raspberryPiUrl}`);
     
     // Forward the request to the Raspberry Pi
     const response = await axios.post(`${raspberryPiUrl}/api/alexa`, req.body, {
@@ -105,7 +134,21 @@ app.post('/alexa', async (req, res) => {
     console.log('Received Alexa request:', JSON.stringify(req.body));
     
     // Get request type
-    const requestType = req.body.request.type;
+    const requestType = req.body.request?.type;
+    
+    if (!requestType) {
+      console.error('Invalid Alexa request format - missing request type');
+      return res.status(400).json({
+        version: '1.0',
+        response: {
+          outputSpeech: {
+            type: 'PlainText',
+            text: 'Invalid request format.'
+          },
+          shouldEndSession: true
+        }
+      });
+    }
     
     // Handle different request types
     if (requestType === 'LaunchRequest') {
@@ -127,8 +170,24 @@ app.post('/alexa', async (req, res) => {
       });
     } 
     else if (requestType === 'IntentRequest') {
-      const intentName = req.body.request.intent.name;
-      const slots = req.body.request.intent.slots || {};
+      const intentName = req.body.request.intent?.name;
+      const slots = req.body.request.intent?.slots || {};
+      
+      if (!intentName) {
+        console.error('Missing intent name in Alexa request');
+        return res.status(400).json({
+          version: '1.0',
+          response: {
+            outputSpeech: {
+              type: 'PlainText',
+              text: 'I couldn\'t understand your request.'
+            },
+            shouldEndSession: false
+          }
+        });
+      }
+      
+      console.log(`Processing intent: ${intentName}`);
       
       let speakOutput = '';
       let intentData = {
@@ -158,11 +217,15 @@ app.post('/alexa', async (req, res) => {
         const clientId = 'default';
         const raspberryPiUrl = getRaspberryPiUrl(clientId);
         
+        console.log(`Forwarding camera control to: ${raspberryPiUrl}`);
+        
         // Forward to Raspberry Pi
         try {
           await axios.post(`${raspberryPiUrl}/api/alexa`, intentData, {
             timeout: 5000
           });
+          
+          console.log('Successfully forwarded to Raspberry Pi');
           
           // Generate response based on intent and slots
           if (intentName === 'OpenCameraIntent') {
@@ -252,47 +315,62 @@ app.post('/alexa', async (req, res) => {
 
 // Ping endpoint for the Raspberry Pi to keep the connection alive
 app.post('/api/ping', authenticateApi, (req, res) => {
-  const { clientId, url } = req.body;
-  
-  if (!clientId) {
-    return res.status(400).json({ error: 'Missing client ID' });
-  }
-  
-  // Create or update the client entry
-  if (!connectedPis[clientId] && url) {
-    connectedPis[clientId] = {
-      url,
-      name: req.body.name || 'Unnamed Pi',
-      lastSeen: new Date()
-    };
-  } else if (connectedPis[clientId]) {
-    connectedPis[clientId].lastSeen = new Date();
-    if (url) {
-      connectedPis[clientId].url = url;
+  try {
+    const { clientId, url } = req.body;
+    
+    if (!clientId) {
+      return res.status(400).json({ error: 'Missing client ID' });
     }
-    if (req.body.name) {
-      connectedPis[clientId].name = req.body.name;
+    
+    // Create or update the client entry
+    if (!connectedPis[clientId] && url) {
+      connectedPis[clientId] = {
+        url,
+        name: req.body.name || 'Unnamed Pi',
+        lastSeen: new Date()
+      };
+    } else if (connectedPis[clientId]) {
+      connectedPis[clientId].lastSeen = new Date();
+      if (url) {
+        connectedPis[clientId].url = url;
+      }
+      if (req.body.name) {
+        connectedPis[clientId].name = req.body.name;
+      }
     }
+    
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Error in /api/ping:', error);
+    return res.status(500).json({ error: 'Internal server error' });
   }
-  
-  return res.status(200).json({ success: true });
 });
 
 // Client management - clean up stale clients
 setInterval(() => {
-  const now = new Date();
-  const staleThreshold = 5 * 60 * 1000; // 5 minutes
-  
-  Object.keys(connectedPis).forEach(clientId => {
-    const client = connectedPis[clientId];
-    if (now - client.lastSeen > staleThreshold) {
-      console.log(`Removing stale client: ${clientId}`);
-      delete connectedPis[clientId];
-    }
-  });
+  try {
+    const now = new Date();
+    const staleThreshold = 5 * 60 * 1000; // 5 minutes
+    
+    Object.keys(connectedPis).forEach(clientId => {
+      const client = connectedPis[clientId];
+      if (now - client.lastSeen > staleThreshold) {
+        console.log(`Removing stale client: ${clientId}`);
+        delete connectedPis[clientId];
+      }
+    });
+  } catch (error) {
+    console.error('Error cleaning stale clients:', error);
+  }
 }, 60 * 1000); // Check every minute
 
 // Start the server
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
+  console.log(`Environment variables:`);
+  console.log(`- PORT: ${PORT}`);
+  console.log(`- API_KEY configured: ${process.env.API_KEY ? 'Yes' : 'No'}`);
+  console.log(`- API_KEY length: ${process.env.API_KEY ? process.env.API_KEY.length : 0}`);
+  console.log(`- DEFAULT_RASPBERRY_PI_URL: ${process.env.DEFAULT_RASPBERRY_PI_URL || 'not set'}`);
+  console.log(`Server is ready to accept connections`);
 });
